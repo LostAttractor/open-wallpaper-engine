@@ -668,6 +668,9 @@ struct JsRuntime::Impl {
     JSRuntime*      rt { nullptr };
     JSContext*      ctx { nullptr };
     EngineHostState host;
+    // Last pointer sample consumed by TickAll; frame ticks are not motion.
+    float previous_cursor_x { 0.0f }, previous_cursor_y { 0.0f };
+    bool  cursor_was_in_window { false };
     // Compiled-module dedup: same script source under the same sha is
     // imported once per runtime, exposing one shared namespace. A
     // FieldScript holds a JS_DupValue of the namespace.
@@ -3748,6 +3751,13 @@ void JsRuntime::TickAll(slice<owe::SceneAnimationEventDispatch> animation_events
     // the callbacks made this frame.
     const CursorWorld cursor      = CursorToWorld(m_impl->host.inputs);
     const bool        in_window   = m_impl->host.inputs.cursor_in_window;
+    const bool        cursor_moved =
+        in_window && (! m_impl->cursor_was_in_window ||
+                      m_impl->host.inputs.cursor_x != m_impl->previous_cursor_x ||
+                      m_impl->host.inputs.cursor_y != m_impl->previous_cursor_y);
+    m_impl->previous_cursor_x     = m_impl->host.inputs.cursor_x;
+    m_impl->previous_cursor_y     = m_impl->host.inputs.cursor_y;
+    m_impl->cursor_was_in_window  = in_window;
     const uint32_t    btn_pressed = m_impl->host.inputs.mouse_buttons_pressed;
     const uint32_t    btn_release = m_impl->host.inputs.mouse_buttons_released;
     JSValue           ev_shared   = JS_UNDEFINED;
@@ -3772,7 +3782,7 @@ void JsRuntime::TickAll(slice<owe::SceneAnimationEventDispatch> animation_events
                                 I->sha);
             I->cursor_inside = now_inside;
         }
-        if (now_inside) {
+        if (now_inside && cursor_moved) {
             InvokeEventCallback(
                 ctx, I->module_ns, "cursorMove", ensure_ev(-1), m_impl.get(), I->sha);
         }
