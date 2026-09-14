@@ -2857,6 +2857,8 @@ public:
     }
     void SetPointerPosition(array<float, 2> position) { m_pointer_position = rstd::move(position); }
     auto PointerPosition() const -> array<float, 2> { return m_pointer_position; }
+    void SetPointerInWindow(bool inside) { m_pointer_in_window = inside; }
+    bool PointerInWindow() const { return m_pointer_in_window; }
     void SetClearColor(array<float, 3> color) { m_clear_color = rstd::move(color); }
     auto ClearColor() const -> array<float, 3> { return m_clear_color.clone(); }
     void SetClearColorUserKey(String key) { m_clear_color_user_key = rstd::move(key); }
@@ -2945,6 +2947,7 @@ private:
     array<i32, 2>                 m_ortho { i32(1920), i32(1080) };
     f32                           m_viewport_scale { 1.0f };
     array<float, 2>               m_pointer_position { 0.5f, 0.5f };
+    bool                          m_pointer_in_window { false };
     array<float, 3>               m_clear_color { 1.0f, 1.0f, 1.0f };
     String                        m_clear_color_user_key;
     Box<SceneNode>                m_scene_graph;

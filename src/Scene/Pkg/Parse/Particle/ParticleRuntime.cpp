@@ -569,6 +569,7 @@ void ParticleSubSystem::UpdateFrameInput(f64 frame_time) {
     }
     m_frame.subsystem              = this;
     m_frame.mouse_local            = mouse_local;
+    m_frame.mouse_in_window        = m_scene.PointerInWindow();
     m_frame.world_from_local_dir   = world_from_local_dir;
     m_frame.local_from_world_dir   = local_from_world_dir;
     m_frame.world_from_spawn_space = world_from_spawn_space;

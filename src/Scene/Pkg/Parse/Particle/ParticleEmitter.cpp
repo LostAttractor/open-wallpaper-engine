@@ -140,6 +140,15 @@ bool InstanceCanEmit(ref<ParticleFrame> frame) {
     return ! frame->subsystem->InstanceState(frame->instance_index).death;
 }
 
+bool TimedEmissionEnabled(ref<ParticleFrame> frame, i32 controlpoint) {
+    auto points = frame->subsystem->Controlpoints();
+    if (controlpoint >= i32() && rstd::as_cast<usize>(controlpoint) < points.len() &&
+        points[rstd::as_cast<usize>(controlpoint)].link_mouse) {
+        return frame->mouse_in_window;
+    }
+    return true;
+}
+
 } // namespace
 
 void BoxEmitterProgram::Compile(particle::ParticleViewCompiler& compiler) {
@@ -156,14 +165,19 @@ void BoxEmitterProgram::Emit(particle::ParticleEmitterContext& context) {
     emitter.elapsed += frame->emitter_delta;
     if (m_args.duration > 0.0f && emitter.elapsed > f64(m_args.duration) && pending_count == u32())
         return;
-    emitter.timer += frame->emitter_delta;
+    // Cursor-bound emitters run even while stationary, but must not accrue
+    // an emission backlog while the cursor is outside this output.
+    const bool timed_emission = TimedEmissionEnabled(frame, m_args.controlpoint);
+    if (timed_emission) emitter.timer += frame->emitter_delta;
 
     auto  controlpoints = frame->subsystem->Controlpoints();
     auto  origin        = ResolveEmitterOrigin(controlpoints, m_args.controlpoint, m_args.origin);
     float emit_speed = m_args.emit_speed *
                        AudioResponseScale(frame->audio_average.as_slice(), m_args.audio_response);
-    auto  timed_emit_count = ResolveEmitCount(
-        emitter.timer, emit_speed, m_args.instantaneous, m_args.one_per_frame, context.Empty());
+    auto timed_emit_count = timed_emission
+                                ? ResolveEmitCount(emitter.timer, emit_speed, m_args.instantaneous,
+                                                   m_args.one_per_frame, context.Empty())
+                                : u32();
     auto emit_count = timed_emit_count.saturating_add(pending_count);
     auto requests   = context.Acquire(rstd::as_cast<usize>(emit_count), EmitDuration(emit_speed));
     auto columns    = m_pipeline->Bind(context.View());
@@ -208,7 +222,8 @@ void SphereEmitterProgram::Emit(particle::ParticleEmitterContext& context) {
     emitter.elapsed += frame->emitter_delta;
     if (m_args.duration > 0.0f && emitter.elapsed > f64(m_args.duration) && pending_count == u32())
         return;
-    emitter.timer += frame->emitter_delta;
+    const bool timed_emission = TimedEmissionEnabled(frame, m_args.controlpoint);
+    if (timed_emission) emitter.timer += frame->emitter_delta;
 
     auto controlpoints = frame->subsystem->Controlpoints();
     auto origin        = ResolveEmitterOrigin(controlpoints, m_args.controlpoint, m_args.origin);
@@ -216,8 +231,10 @@ void SphereEmitterProgram::Emit(particle::ParticleEmitterContext& context) {
     auto            dimensions = ActiveAxisCount(directions);
     float emit_speed = m_args.emit_speed *
                        AudioResponseScale(frame->audio_average.as_slice(), m_args.audio_response);
-    auto  timed_emit_count = ResolveEmitCount(
-        emitter.timer, emit_speed, m_args.instantaneous, m_args.one_per_frame, context.Empty());
+    auto timed_emit_count = timed_emission
+                                ? ResolveEmitCount(emitter.timer, emit_speed, m_args.instantaneous,
+                                                   m_args.one_per_frame, context.Empty())
+                                : u32();
     auto emit_count = timed_emit_count.saturating_add(pending_count);
     auto requests   = context.Acquire(rstd::as_cast<usize>(emit_count), EmitDuration(emit_speed));
     auto columns    = m_pipeline->Bind(context.View());

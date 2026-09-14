@@ -169,6 +169,39 @@ struct InvalidKeyProgram {
 
 struct EmptyFrame {};
 
+auto MakeTimedParticleSubsystem(owe::Scene& scene, const char* emitter_name,
+                               i32 controlpoint = i32(), float duration = 0.0f)
+    -> Box<owe::ParticleSubSystem> {
+    auto subsystem = Box<owe::ParticleSubSystem>::make(scene,
+                                                       std::make_shared<owe::SceneMesh>(),
+                                                       u32(64),
+                                                       f64(1.0),
+                                                       u32(1),
+                                                       f64(1.0),
+                                                       owe::ParticleSubSystem::SpawnType::STATIC,
+                                                       owe::ParticleAnimationSpec {});
+    subsystem->AddInitializer(owe::ParticleParser::GenInitializer(
+        owe::ParseJson(R"({"name":"lifetimerandom","min":0.5,"max":0.5})").unwrap(), u32(64)));
+    owe::wpscene::Emitter emitter;
+    emitter.name         = emitter_name;
+    emitter.rate         = 64.0f;
+    emitter.controlpoint = controlpoint;
+    emitter.duration     = duration;
+    subsystem->AddEmitter(owe::ParticleParser::GenEmitter(emitter, *subsystem, usize()));
+    subsystem->Finalize();
+    return subsystem;
+}
+
+auto LiveParticleCount(owe::ParticleSubSystem& subsystem) -> usize {
+    usize count {};
+    for (usize index {}; index < subsystem.System().InstanceCount(); ++index) {
+        for (const auto& state : subsystem.System().Instance(index).Binding().Read().States()) {
+            if (state.active) ++count;
+        }
+    }
+    return count;
+}
+
 } // namespace
 
 TEST(ParticleStorage, OwnsIndependentAttributesAndReusesStableSlots) {
@@ -415,6 +448,87 @@ TEST(ParticleSubSystem, PlaybackResetClearsAndRestartsIndependentStorage) {
     playback->reset_sequence.fetch_add(u32(1), rstd::sync::atomic::Ordering::AcqRel);
     subsystem.Tick(f64(1.0 / 60.0), false);
     EXPECT_GT(subsystem.System().Instance(usize()).Storage().Len(), usize());
+}
+
+TEST(ParticleSubSystem, CursorEmittersRunWhileStationaryAndStopOutsideTheOutput) {
+    for (const char* name : { "sphererandom", "boxrandom" }) {
+        owe::Scene scene;
+        scene.SetPointerPosition({ 0.25f, 0.5f });
+        auto subsystem = MakeTimedParticleSubsystem(scene, name);
+        subsystem->ControlpointsMut()[usize()].link_mouse = true;
+        auto owner = rstd::sync::Arc<owe::SceneNode>::make();
+        subsystem->SetOwnerNode(owner.as_ptr());
+
+        // No pointer has entered this output yet.
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize());
+        scene.SetPointerInWindow(true);
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        ASSERT_EQ(LiveParticleCount(*subsystem), usize(1));
+
+        // A stationary pointer keeps emitting, including above other windows.
+        for (int i = 0; i < 10; ++i) {
+            scene.SetPointerPosition({ 0.25f, 0.5f });
+            owner->SetTranslate({ static_cast<float>(i), 0.0f, 0.0f });
+            subsystem->Tick(f64(1.0 / 64.0), false);
+            EXPECT_EQ(LiveParticleCount(*subsystem), usize(static_cast<rstd::size_t>(i + 2)));
+        }
+        // Leaving stops emission while existing particles continue to age.
+        scene.SetPointerInWindow(false);
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize(11));
+        for (int i = 0; i < 256; ++i) subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize());
+        // Re-entering at the same coordinates restarts without a backlog.
+        scene.SetPointerInWindow(true);
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize(1));
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize(2));
+    }
+}
+
+TEST(ParticleSubSystem, MouseForceControlpointsDoNotStopIndependentEmitters) {
+    for (const char* name : { "sphererandom", "boxrandom" }) {
+        owe::Scene scene;
+        auto subsystem = MakeTimedParticleSubsystem(scene, name);
+        // Dust can react to the cursor at point 1 while emitting from point 0.
+        subsystem->ControlpointsMut()[usize(1)].link_mouse = true;
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize(1));
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize(2));
+    }
+}
+
+TEST(ParticleSubSystem, ExplicitCursorParticleEmissionsWorkOutsideTheOutput) {
+    for (const char* name : { "sphererandom", "boxrandom" }) {
+        owe::Scene scene;
+        auto subsystem = MakeTimedParticleSubsystem(scene, name, i32(2));
+        subsystem->ControlpointsMut()[usize(2)].link_mouse = true;
+        auto playback = rstd::sync::Arc<owe::ParticlePlaybackState>::make();
+        subsystem->SetPlaybackState(playback.clone());
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize());
+        playback->pending_emit_count.store(u32(3));
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize(3));
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize(3));
+    }
+}
+
+TEST(ParticleSubSystem, CursorEmitterDurationElapsesOutsideTheOutput) {
+    for (const char* name : { "sphererandom", "boxrandom" }) {
+        owe::Scene scene;
+        scene.SetPointerPosition({ 0.25f, 0.5f });
+        auto subsystem = MakeTimedParticleSubsystem(scene, name, i32(), 0.125f);
+        subsystem->ControlpointsMut()[usize()].link_mouse = true;
+        subsystem->Tick(f64(0.25), false);
+        scene.SetPointerInWindow(true);
+        subsystem->Tick(f64(1.0 / 64.0), false);
+        EXPECT_EQ(LiveParticleCount(*subsystem), usize());
+    }
 }
 
 TEST(ParticleSubSystem, ConvertsWorldSpaceFollowAnchorsIntoChildLocalSpace) {
