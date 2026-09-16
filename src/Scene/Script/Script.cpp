@@ -3,6 +3,10 @@ module;
 #include <rstd/macro.hpp>
 #include <rstd/enum.hpp>
 #include "quickjs.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 module wescene.script;
 import eigen;
@@ -926,7 +930,39 @@ JSValue EngineClearDeferred(JSContext* ctx, JSValueConst, int argc, JSValueConst
 
 namespace
 {
-struct PersistedLocalStorage {};
+PathBuf LocalStorageSidecar(const PathBuf& path, ref<str> suffix) {
+    auto name = path.as_path().as_os_str().to_os_string();
+    name.push(suffix);
+    return PathBuf::from(rstd::move(name));
+}
+
+// Lock a stable sidecar inode: the data file is atomically replaced below.
+class LocalStorageLock {
+public:
+    explicit LocalStorageLock(const PathBuf& path) {
+        auto lock_path = LocalStorageSidecar(path, ".lock"_str);
+        auto native    = lock_path.as_path().to_cstring().unwrap();
+        m_fd           = ::open(native.as_ptr(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (m_fd < 0) return;
+        int result;
+        do {
+            result = ::flock(m_fd, LOCK_EX);
+        } while (result < 0 && errno == EINTR);
+        if (result < 0) {
+            ::close(m_fd);
+            m_fd = -1;
+        }
+    }
+    ~LocalStorageLock() {
+        if (m_fd >= 0) ::close(m_fd);
+    }
+    LocalStorageLock(const LocalStorageLock&)            = delete;
+    LocalStorageLock& operator=(const LocalStorageLock&) = delete;
+    bool              acquired() const { return m_fd >= 0; }
+
+private:
+    int m_fd { -1 };
+};
 } // namespace
 
 void FlushLocalStorage(EngineHostState* host) {
@@ -934,32 +970,79 @@ void FlushLocalStorage(EngineHostState* host) {
     auto object = rstd::json::Map::make();
     for (auto [k, v] : host->ls_data.iter()) object.insert(k->clone(), Json::String(v->clone()));
     auto out    = Json::Object(rstd::move(object));
-    auto path   = host->ls_path.as_path();
     auto source = rstd::json::to_string(out);
-    if (rstd::fs::write(path, source.as_str().as_bytes()).is_err())
-        rstd_warn("localStorage flush: cannot write {}", host->ls_path.as_path().to_string_lossy());
+    // The caller holds LocalStorageLock, so one reusable temporary path is
+    // sufficient. Readers see either complete snapshot, even if a writer exits.
+    auto temporary = LocalStorageSidecar(host->ls_path, ".tmp"_str);
+    if (rstd::fs::write(temporary.as_path(), source.as_str().as_bytes()).is_err()) {
+        rstd_warn("localStorage flush: cannot write {}", temporary.as_path().to_string_lossy());
+        (void)rstd::fs::remove_file(temporary.as_path());
+        return;
+    }
+    auto published = rstd::fs::rename(temporary.as_path(), host->ls_path.as_path());
+    if (published.is_err()) {
+        rstd_warn("localStorage flush: cannot publish {}: {}",
+                  host->ls_path.as_path().to_string_lossy(),
+                  published.unwrap_err());
+        (void)rstd::fs::remove_file(temporary.as_path());
+    }
 }
 
-void LoadLocalStorage(EngineHostState* host) {
-    host->ls_data.clear();
-    if (host->ls_path.is_empty()) return;
-    auto path   = host->ls_path.as_path();
-    auto source = rstd::fs::read_to_string(path);
-    if (source.is_err()) return;
+bool LoadLocalStorage(EngineHostState* host) {
+    if (host->ls_path.is_empty()) {
+        host->ls_data.clear();
+        return true;
+    }
+    auto source = rstd::fs::read_to_string(host->ls_path.as_path());
+    if (source.is_err()) {
+        if (source.unwrap_err().kind().code == rstd::io::error::ErrorKind::NotFound) {
+            host->ls_data.clear();
+            return true;
+        }
+        rstd_warn("localStorage load: cannot open {}", host->ls_path.as_path().to_string_lossy());
+        return false;
+    }
     auto parsed = rstd::json::from_str(source.unwrap().as_str());
     if (parsed.is_err()) {
         rstd_warn("localStorage parse failed: {}", parsed.unwrap_err());
-        return;
+        return false;
     }
     auto doc    = parsed.unwrap();
     auto object = doc.as_object();
-    if (object.is_none()) return;
+    if (object.is_none()) return false;
+    host->ls_data.clear();
     (*object)->iter().for_each([&](auto entry) {
         auto [entry_key, entry_value] = entry;
         const auto& value             = *entry_value;
         if (auto stored = value.as_str(); stored.is_some())
             (void)host->ls_data.insert(entry_key->clone(), rstd::into(*stored));
     });
+    return true;
+}
+
+void UpdateLocalStorage(EngineHostState* host, ref<str> key, Option<ref<str>> value) {
+    const auto update = [&] {
+        if (value) {
+            (void)host->ls_data.insert(String::make(key), String::make(*value));
+        } else {
+            (void)host->ls_data.remove(key);
+        }
+    };
+    if (host->ls_path.is_empty()) {
+        update();
+        return;
+    }
+    LocalStorageLock lock(host->ls_path);
+    if (! lock.acquired()) {
+        rstd_warn("localStorage update: cannot lock {}", host->ls_path.as_path().to_string_lossy());
+        update();
+        return;
+    }
+    // Each display has its own runtime/cache. Merge this mutation into the
+    // latest committed map while locked, rather than flushing a stale map.
+    const bool loaded = LoadLocalStorage(host);
+    update();
+    if (loaded) FlushLocalStorage(host);
 }
 
 JSValue LocalStorageGet(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
@@ -986,13 +1069,13 @@ JSValue LocalStorageSet(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
     }
     const char* s    = JS_ToCString(ctx, jv);
     auto*       host = static_cast<EngineHostState*>(JS_GetContextOpaque(ctx));
-    if (s)
-        (void)host->ls_data.insert(rstd::into(rstd::cppstd::as_str(key).unwrap()),
-                                   rstd::into(rstd::cppstd::as_str(s).unwrap()));
+    if (s) {
+        UpdateLocalStorage(
+            host, rstd::cppstd::as_str(key).unwrap(), Some(rstd::cppstd::as_str(s).unwrap()));
+    }
     if (s) JS_FreeCString(ctx, s);
     JS_FreeValue(ctx, jv);
     JS_FreeCString(ctx, key);
-    FlushLocalStorage(host);
     return JS_UNDEFINED;
 }
 
@@ -1001,9 +1084,8 @@ JSValue LocalStorageRemove(JSContext* ctx, JSValueConst, int argc, JSValueConst*
     const char* key = JS_ToCString(ctx, argv[0]);
     if (! key) return JS_UNDEFINED;
     auto* host = static_cast<EngineHostState*>(JS_GetContextOpaque(ctx));
-    (void)host->ls_data.remove(rstd::cppstd::as_str(key).unwrap());
+    UpdateLocalStorage(host, rstd::cppstd::as_str(key).unwrap(), None());
     JS_FreeCString(ctx, key);
-    FlushLocalStorage(host);
     return JS_UNDEFINED;
 }
 
@@ -3747,6 +3829,7 @@ void JsRuntime::SetBoneResolvers(BoneIndexResolver     index_resolver,
 
 void JsRuntime::SetPersistence(PathBuf path) {
     m_impl->host.ls_path = rstd::move(path);
+    m_impl->host.ls_data.clear();
     LoadLocalStorage(&m_impl->host);
 }
 
@@ -3825,19 +3908,19 @@ void JsRuntime::TickAll(slice<owe::SceneAnimationEventDispatch> animation_events
     // cursorEnter/Leave/Move/Down/Up/Click that the script's module
     // exports. Runs before update() so update can react to state writes
     // the callbacks made this frame.
-    const CursorWorld cursor      = CursorToWorld(m_impl->host.inputs, m_impl->host.scene);
-    const bool        in_window   = m_impl->host.inputs.cursor_in_window;
+    const CursorWorld cursor    = CursorToWorld(m_impl->host.inputs, m_impl->host.scene);
+    const bool        in_window = m_impl->host.inputs.cursor_in_window;
     const bool        cursor_moved =
         in_window && (! m_impl->cursor_was_in_window ||
                       m_impl->host.inputs.cursor_x != m_impl->previous_cursor_x ||
                       m_impl->host.inputs.cursor_y != m_impl->previous_cursor_y);
-    m_impl->previous_cursor_x     = m_impl->host.inputs.cursor_x;
-    m_impl->previous_cursor_y     = m_impl->host.inputs.cursor_y;
-    m_impl->cursor_was_in_window  = in_window;
+    m_impl->previous_cursor_x        = m_impl->host.inputs.cursor_x;
+    m_impl->previous_cursor_y        = m_impl->host.inputs.cursor_y;
+    m_impl->cursor_was_in_window     = in_window;
     const rstd::uint32_t btn_pressed = m_impl->host.inputs.mouse_buttons_pressed;
     const rstd::uint32_t btn_release = m_impl->host.inputs.mouse_buttons_released;
-    JSValue           ev_shared   = JS_UNDEFINED;
-    auto              ensure_ev   = [&](int button) -> JSValue {
+    JSValue              ev_shared   = JS_UNDEFINED;
+    auto                 ensure_ev   = [&](int button) -> JSValue {
         if (! JS_IsUndefined(ev_shared)) JS_FreeValue(ctx, ev_shared);
         ev_shared = MakeCursorEvent(ctx, cursor, button);
         return ev_shared;

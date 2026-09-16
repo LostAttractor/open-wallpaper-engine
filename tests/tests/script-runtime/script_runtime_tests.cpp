@@ -1635,6 +1635,86 @@ TEST(ScriptLocalStorage, PreservesNativePathBytes) {
     }
 }
 
+TEST(ScriptLocalStorage, IndependentRuntimesMergeWritesAndDoNotRestoreDeletedKeys) {
+    const std::string path = MakeTmpLsPath("shared");
+    JsRuntime         first;
+    JsRuntime         second;
+    first.SetPersistence(rstd::path::PathBuf::from(rstd::cppstd::as_str(path).unwrap()));
+    second.SetPersistence(rstd::path::PathBuf::from(rstd::cppstd::as_str(path).unwrap()));
+    ASSERT_NE(MakeProbe(first, "test/ls_first", "localStorage.set('a', 1);"), nullptr);
+    ASSERT_NE(MakeProbe(second, "test/ls_second", "localStorage.set('b', 2);"), nullptr);
+    {
+        JsRuntime reader;
+        reader.SetPersistence(rstd::path::PathBuf::from(rstd::cppstd::as_str(path).unwrap()));
+        auto* probe = MakeProbe(reader, "test/ls_merged", R"JS(
+            export function update() {
+                return (localStorage.get('a') ?? 0) + (localStorage.get('b') ?? 0);
+            }
+        )JS");
+        ASSERT_NE(probe, nullptr);
+        reader.TickAll();
+        EXPECT_EQ(LastScalar(probe), 3.0);
+    }
+
+    ASSERT_NE(MakeProbe(first, "test/ls_delete", "localStorage.remove('a');"), nullptr);
+    ASSERT_NE(MakeProbe(second, "test/ls_stale_writer", "localStorage.set('c', 4);"), nullptr);
+    JsRuntime reader;
+    reader.SetPersistence(rstd::path::PathBuf::from(rstd::cppstd::as_str(path).unwrap()));
+    auto* probe = MakeProbe(reader, "test/ls_after_delete", R"JS(
+        export function update() {
+            return localStorage.get('a') === undefined
+                ? (localStorage.get('b') ?? 0) + (localStorage.get('c') ?? 0) : -1;
+        }
+    )JS");
+    ASSERT_NE(probe, nullptr);
+    reader.TickAll();
+    EXPECT_EQ(LastScalar(probe), 6.0);
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(path + ".lock", error);
+}
+
+TEST(ScriptLocalStorage, ConcurrentRuntimesKeepAllIndependentKeys) {
+    const std::string        path    = MakeTmpLsPath("concurrent");
+    constexpr int            writers = 4;
+    constexpr int            writes  = 16;
+    std::atomic<int>         ready { 0 };
+    std::vector<std::thread> threads;
+    for (int writer = 0; writer < writers; ++writer) {
+        threads.emplace_back([&, writer] {
+            JsRuntime runtime;
+            runtime.SetPersistence(rstd::path::PathBuf::from(rstd::cppstd::as_str(path).unwrap()));
+            ready.fetch_add(1);
+            while (ready.load() != writers) std::this_thread::yield();
+            for (int index = 0; index < writes; ++index) {
+                const auto key    = std::to_string(writer) + "_" + std::to_string(index);
+                const auto script = "localStorage.set('" + key + "', 1);";
+                const auto sha    = "test/ls_concurrent_" + key;
+                EXPECT_NE(MakeProbe(runtime, sha.c_str(), script.c_str()), nullptr);
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    JsRuntime reader;
+    reader.SetPersistence(rstd::path::PathBuf::from(rstd::cppstd::as_str(path).unwrap()));
+    auto* probe = MakeProbe(reader, "test/ls_concurrent_reader", R"JS(
+        export function update() {
+            let count = 0;
+            for (let writer = 0; writer < 4; ++writer)
+                for (let index = 0; index < 16; ++index)
+                    count += localStorage.get(writer + '_' + index) ?? 0;
+            return count;
+        }
+    )JS");
+    ASSERT_NE(probe, nullptr);
+    reader.TickAll();
+    EXPECT_EQ(LastScalar(probe), double(writers * writes));
+    EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(path + ".lock", error);
+}
+
 TEST(ScriptLocalStorage, ObjectRoundTrip) {
     const std::string path = MakeTmpLsPath("obj");
 
