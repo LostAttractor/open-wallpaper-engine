@@ -139,7 +139,7 @@ u32 parse_u32(const char* s, u32 fallback) { return waywallen::web_settings::Par
 
 i32 parse_i32(const char* s, i32 fallback) { return waywallen::web_settings::Parse(s, fallback); }
 
-PathBuf derive_cache_dir(ref<str> workshop_id) {
+PathBuf derive_cache_dir(ref<str> workshop_id, ref<str> ipc_path) {
     auto    cache = rstd::env::var_os("XDG_CACHE_HOME"_str);
     PathBuf base;
     if (cache && ! cache->is_empty()) {
@@ -151,6 +151,11 @@ PathBuf derive_cache_dir(ref<str> workshop_id) {
     }
     auto dir = base.join("waywallen-weweb-renderer"_str);
     if (! workshop_id.is_empty()) dir.push(workshop_id);
+    // Chromium exclusively locks root_cache_path. The daemon keeps one IPC
+    // socket name per logical renderer, including across retained restarts.
+    // Separate instances of the same wallpaper must not share that profile.
+    dir.push("instances"_str);
+    if (auto stem = ref<Path>(ipc_path).file_stem()) dir.push(ref<Path>(*stem));
     (void)rstd::fs::create_dir_all(dir.as_path());
     return dir;
 }
@@ -700,7 +705,7 @@ int run(int argc, char** argv) {
     weweb::BrowserHost::InitOptions ho;
     ho.resources_dir = exe_dir.clone();
     ho.locales_dir   = exe_dir.join("locales"_str);
-    ho.cache_dir     = derive_cache_dir(opts.workshop_id.as_str());
+    ho.cache_dir     = derive_cache_dir(opts.workshop_id.as_str(), opts.ipc_path.as_str());
     if (opts.remote_debugging_port > i32()) {
         ho.enable_remote_debugging = true;
         ho.remote_debugging_port   = opts.remote_debugging_port.to_primitive();
