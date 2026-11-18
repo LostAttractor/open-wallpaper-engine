@@ -24,6 +24,7 @@ public:
     void   SetRequiredFps(u16);
     void   FrameBegin();
     void   FrameEnd();
+    void   CompleteScheduledFrame();
 
 private:
     struct Samples {
@@ -35,7 +36,7 @@ private:
     Atomic<u16>             m_req_fps { u16(15) };
     Atomic<u64>             m_frametime {};
     Atomic<u64>             m_ideatime {};
-    Atomic<u32>             m_frame_busy_count {};
+    Atomic<bool>            m_frame_pending {};
     Instant                 m_clock { Instant::now() };
     ThreadTimer             m_timer;
 };

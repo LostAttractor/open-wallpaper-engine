@@ -59,7 +59,8 @@ class RenderMsg final {
               (SetAudioResponseDemandCallback, (AudioResponseDemandCallback callback;)),
               (SetAudioResponseEnabled, (bool enabled;)),
               (SetAudioPcmWindow, (audio::PcmWindow window;)), (EndAudioResponse),
-              (Stop, (bool stop;)), (Draw), (SwapchainReady, (bool ready; u32 width; u32 height;)),
+              (Stop, (bool stop;)), (Draw, (bool scheduled;)),
+              (SwapchainReady, (bool ready; u32 width; u32 height;)),
               (RequestPreparedPassDiagnostics, (RenderPassDiagnosticCallback cb;)),
               (RequestPreparationDiagnostics, (ScenePreparationDiagnosticCallback cb;)), (Shutdown))
 };
@@ -445,9 +446,12 @@ void SceneRenderController::start() {
                     m_scene_audio_response.end();
                 }
                 RSTD_CASE_PAYLOAD(Stop, value) { on(rstd::move(value)); }
-                RSTD_CASE(Draw) {
-                    onDraw();
-                    maintainResources();
+                RSTD_CASE_PAYLOAD(Draw, value) {
+                    if (! value.scheduled || frame_timer.Running()) {
+                        onDraw();
+                        maintainResources();
+                    }
+                    if (value.scheduled) frame_timer.CompleteScheduledFrame();
                 }
                 RSTD_CASE_PAYLOAD(SwapchainReady, value) { on(rstd::move(value)); }
                 RSTD_CASE_PAYLOAD(RequestPreparedPassDiagnostics, value) { on(rstd::move(value)); }
@@ -843,7 +847,7 @@ void SceneRenderController::on(RenderMsg::SwapchainReady_payload&& m) {
     }
     if (m_stopped) {
         frame_timer.Stop();
-        if (extent_changed && m_tx) (void)m_tx->send(RenderMsg::Draw());
+        if (extent_changed && m_tx) (void)m_tx->send(RenderMsg::Draw(false));
     } else
         frame_timer.Run();
 }
@@ -1332,7 +1336,7 @@ void SceneRuntimeController::loadScene() {
         abort_load();
         return;
     }
-    if (rtx.send(RenderMsg::Draw()).is_err()) abort_load();
+    if (rtx.send(RenderMsg::Draw(false)).is_err()) abort_load();
 }
 
 bool SceneRuntimeController::init() {
@@ -1349,7 +1353,7 @@ bool SceneRuntimeController::init() {
         auto& frameTimer = m_render_controller->frame_timer;
         auto  rtx        = m_render_controller->sender();
         frameTimer.SetCallback(Some(FrameTimer::Callback::make([rtx]() mutable {
-            (void)rtx.send(RenderMsg::Draw());
+            (void)rtx.send(RenderMsg::Draw(true));
         })));
         frameTimer.SetRequiredFps(u16(15));
         frameTimer.Run();
@@ -1402,7 +1406,7 @@ void SceneWallpaper::pause() { m_runtime->post(MainMsg::Stop(true)); }
 void SceneWallpaper::pause(uint32_t fade_ms) {
     m_runtime->post(MainMsg::Stop(true, u32(fade_ms), true));
 }
-void SceneWallpaper::requestFrame() { m_runtime->post(RenderMsg::Draw()); }
+void SceneWallpaper::requestFrame() { m_runtime->post(RenderMsg::Draw(false)); }
 
 void SceneWallpaper::mouseInput(double x, double y) {
     m_runtime->renderController()->setMousePos(x, y);

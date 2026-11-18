@@ -18,7 +18,7 @@ bool WaitFor(const Atomic<u32>& count, u32 target) {
 }
 } // namespace
 
-TEST(ThreadTimer, StopsWithoutEmittingAndCanRestart) {
+TEST(ThreadTimer, StopsAndUpdatesItsIntervalOnRestart) {
     Atomic<u32>      calls {};
     owe::ThreadTimer timer(owe::ThreadTimer::Callback::make([&] {
         calls.fetch_add(u32(1));
@@ -32,8 +32,9 @@ TEST(ThreadTimer, StopsWithoutEmittingAndCanRestart) {
     timer.Stop();
     EXPECT_TRUE(started.elapsed() < Duration::from_secs(u64(3)));
     EXPECT_EQ(calls.load(), u32());
-    timer.SetInterval(Duration::from_millis(u64(1)));
     timer.Start();
+    rstd::thread::sleep(Duration::from_millis(u64(10)));
+    timer.SetInterval(Duration::from_millis(u64(1)));
     EXPECT_TRUE(WaitFor(calls, u32(2)));
     timer.Stop();
     auto stopped = calls.load();
@@ -51,14 +52,21 @@ TEST(FrameTimer, OwnsMutableCallbackAndPreservesBackpressure) {
         })));
     timer.SetRequiredFps(u16(1000));
     timer.Run();
-    ASSERT_TRUE(WaitFor(calls, u32(4)));
+    ASSERT_TRUE(WaitFor(calls, u32(1)));
     rstd::thread::sleep(Duration::from_millis(u64(10)));
-    EXPECT_EQ(calls.load(), u32(4));
+    EXPECT_EQ(calls.load(), u32(1));
     timer.SetCallback(None());
+    // A manual draw records a sample, but cannot retire the queued timer request.
     timer.FrameBegin();
     timer.FrameEnd();
-    EXPECT_TRUE(WaitFor(calls, u32(5)));
     timer.Stop();
+    timer.Run();
+    rstd::thread::sleep(Duration::from_millis(u64(10)));
+    EXPECT_EQ(calls.load(), u32(1));
+    timer.CompleteScheduledFrame();
+    EXPECT_TRUE(WaitFor(calls, u32(2)));
+    timer.Stop();
+    timer.CompleteScheduledFrame();
     timer.SetCallback(None());
     auto stopped = calls.load();
     timer.Run();
@@ -67,10 +75,33 @@ TEST(FrameTimer, OwnsMutableCallbackAndPreservesBackpressure) {
     EXPECT_EQ(calls.load(), stopped);
 }
 
+TEST(FrameTimer, SlowFramesDoNotAccelerateRequests) {
+    Atomic<u32>     calls {};
+    Atomic<bool>    at_target_period {};
+    owe::FrameTimer timer;
+    timer.SetRequiredFps(u16(20));
+    timer.FrameBegin();
+    rstd::thread::sleep(Duration::from_millis(u64(75)));
+    timer.FrameEnd();
+    ASSERT_GT(timer.FrameTime(), timer.TargetFrameTime());
+    timer.SetCallback(
+        Some(owe::FrameTimer::Callback::make([&, previous = Instant::now()]() mutable {
+            if (calls.load() == u32(1))
+                at_target_period.store(previous.elapsed() >= Duration::from_millis(u64(50)));
+            previous = Instant::now();
+            timer.CompleteScheduledFrame();
+            calls.fetch_add(u32(1));
+        })));
+    timer.Run();
+    ASSERT_TRUE(WaitFor(calls, u32(2)));
+    timer.Stop();
+    EXPECT_TRUE(at_target_period.load());
+}
+
 TEST(FrameTimer, SerializesSamplesWithFpsChanges) {
     owe::FrameTimer timer;
     EXPECT_EQ(timer.RequiredFps(), u16(15));
-    EXPECT_DOUBLE_EQ(timer.TargetFrameTime(), 0.066666);
+    EXPECT_DOUBLE_EQ(timer.TargetFrameTime(), 0.066667);
     timer.SetRequiredFps(u16());
     EXPECT_EQ(timer.RequiredFps(), u16(1));
     EXPECT_DOUBLE_EQ(timer.FrameTime(), 1.0);
